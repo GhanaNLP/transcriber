@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""
+Transcriber - tkinter GUI
+Run: python transcribe.py --audio /path/to/audio --output /path/to/transcripts
+"""
+
+import os
+import re
+import sys
+import glob
+import platform
+import subprocess
+import argparse
+import tkinter as tk
+from tkinter import messagebox, filedialog
+from pathlib import Path
+
+# ── Cross-platform helpers ─────────────────────────────────────────────────────
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX   = platform.system() == "Linux"
+IS_MAC     = platform.system() == "Darwin"
+
+# ── Average character threshold ───────────────────────────────────────────────
+AVG_CHARS_THRESHOLD = 27000
+
+# ── Gemini Prompts ────────────────────────────────────────────────────────────
+GEMINI_PROMPT_1 = (
+    "give me a full accurate transcription of this ghanaian news media audio which is mainly in Twi "
+    "but also contains some english. plain text transcription with no headings and formatting just as i will "
+    "get with a standard ASR like whisper. Write english as english text as english without trying to adapt them to Twi."
+)
+
+GEMINI_PROMPT_2 = (
+    "give me a full accurate transcription of this audio from twi speakers "
+    "who mix english words when speaking twi. plain text transcription."
+)
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Transcriber — batch audio transcription helper"
+    )
+    parser.add_argument(
+        "--audio", "-a",
+        default=None,
+        help="Path to folder containing audio files (mp3, wav, m4a, ogg, flac)"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        help="Path to folder where transcript .txt files will be saved"
+    )
+    return parser.parse_args()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_audio_files(audio_folder):
+    files = []
+    for pat in ["*.mp3", "*.wav", "*.m4a", "*.ogg", "*.flac"]:
+        files.extend(glob.glob(os.path.join(audio_folder, pat)))
+    return sorted(set(files), key=lambda f: os.path.basename(f))
+
+def transcript_path(audio_path, text_folder):
+    return os.path.join(text_folder, Path(audio_path).stem + ".txt")
+
+def get_pending(audio_folder, text_folder):
+    return [f for f in get_audio_files(audio_folder)
+            if not os.path.exists(transcript_path(f, text_folder))]
+
+def get_done_count(audio_folder, text_folder):
+    return len([f for f in get_audio_files(audio_folder)
+                if os.path.exists(transcript_path(f, text_folder))])
+
+def all_transcripts(audio_folder, text_folder):
+    """Return set of stripped transcript contents for duplicate checking."""
+    result = set()
+    for f in get_audio_files(audio_folder):
+        tp = transcript_path(f, text_folder)
+        if os.path.exists(tp):
+            result.add(open(tp, encoding="utf-8").read().strip())
+    return result
+
+SKIP_LOG = "skipped.log"
+
+def skip_log_path(text_folder):
+    return os.path.join(text_folder, SKIP_LOG)
+
+def load_skipped(text_folder):
+    """Return set of basenames that have been permanently skipped."""
+    path = skip_log_path(text_folder)
+    if not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+def save_skipped(text_folder, basename):
+    """Append a filename to the skip log."""
+    with open(skip_log_path(text_folder), "a", encoding="utf-8") as f:
+        f.write(basename + "\n")
+
+
+def remove_consecutive_repetitions(text):
+    """
+    Remove consecutive repeated sentences or blocks of sentences.
+    e.g. "A. B. A. B. A. B." → "A. B."
+    Returns (cleaned_text, n_removed) tuple.
+    """
+    parts = re.split(r'(\s*[.!?\n]+\s*)', text)
+    sentences = []
+    for i in range(0, len(parts) - 1, 2):
+        s = parts[i].strip()
+        delim = parts[i+1] if i+1 < len(parts) else " "
+        if s:
+            sentences.append((s, delim))
+    if parts and parts[-1].strip():
+        sentences.append((parts[-1].strip(), ""))
+
+    if not sentences:
+        return text, 0
+
+    cleaned = [sentences[0]]
+    removed = 0
+
+    i = 1
+    while i < len(sentences):
+        matched = False
+        max_block = (len(sentences) - i) // 2
+        for k in range(min(max_block, 10), 0, -1):
+            block = [s for s, _ in sentences[i:i+k]]
+            prev_block = [s for s, _ in cleaned[-k:]] if len(cleaned) >= k else None
+            if prev_block and [s.lower() for s in block] == [s.lower() for s in prev_block]:
+                removed += k
+                i += k
+                matched = True
+                break
+        if not matched:
+            cleaned.append(sentences[i])
+            i += 1
+
+    result = " ".join(s + d for s, d in cleaned).strip()
+    return result, removed
+
+def validate_transcript(text):
+    """
+    Auto-removes consecutive repetitions, then checks length against fixed threshold.
+    Returns (cleaned_text, warnings) where warnings is a list of strings.
+    """
+    cleaned, n_removed = remove_consecutive_repetitions(text)
+    warnings = []
+
+    avg = AVG_CHARS_THRESHOLD
+    lower = avg * (2 / 3)   # ~18,000
+    upper = avg * (4 / 3)   # ~36,000
+
+    if len(cleaned) < lower:
+        warnings.append(
+            f"Transcript too short: {len(cleaned):,} chars "
+            f"(expected ≥ {int(lower):,}, target is {avg:,}).\n"
+            f"   → Try the other Gemini prompt, or switch Gemini to Thinking Mode "
+            f"for a more complete transcription."
+        )
+    elif len(cleaned) > upper:
+        warnings.append(
+            f"Transcript too long: {len(cleaned):,} chars "
+            f"(expected ≤ {int(upper):,}, target is {avg:,}).\n"
+            f"   → Try the other Gemini prompt, or switch Gemini to Thinking Mode "
+            f"for a more focused output."
+        )
+
+    return cleaned, warnings
+
+
+def copy_to_clipboard(root, text=None, filepath=None):
+    """Cross-platform clipboard copy. filepath copies the file itself; text copies a string."""
+    if text is not None:
+        # Plain text — works on all platforms via tkinter
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+        return True, "text"
+
+    if filepath is not None:
+        # Try to copy the file as a native file object
+        full_path = os.path.abspath(filepath)
+        if IS_LINUX:
+            uri = f"file://{full_path}\r\n"
+            wayland = os.environ.get("WAYLAND_DISPLAY")
+            try:
+                if wayland:
+                    subprocess.run(["wl-copy", "-t", "text/uri-list"],
+                                   input=uri.encode(), check=True)
+                else:
+                    subprocess.run(["xclip", "-selection", "clipboard", "-t", "text/uri-list"],
+                                   input=uri.encode(), check=True)
+                return True, "file"
+            except Exception:
+                # Fallback: copy path as text
+                root.clipboard_clear()
+                root.clipboard_append(full_path)
+                root.update()
+                return True, "path"
+
+        elif IS_WINDOWS:
+            # Windows: use PowerShell to set file on clipboard
+            try:
+                ps_cmd = (
+                    f"$files = New-Object System.Collections.Specialized.StringCollection; "
+                    f"$files.Add('{full_path}'); "
+                    f"[System.Windows.Forms.Clipboard]::SetFileDropList($files)"
+                )
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f"Add-Type -AssemblyName System.Windows.Forms; {ps_cmd}"],
+                    check=True, capture_output=True
+                )
+                return True, "file"
+            except Exception:
+                root.clipboard_clear()
+                root.clipboard_append(full_path)
+                root.update()
+                return True, "path"
+
+        elif IS_MAC:
+            try:
+                subprocess.run(["osascript", "-e",
+                                 f'set the clipboard to (POSIX file "{full_path}")'],
+                                check=True)
+                return True, "file"
+            except Exception:
+                root.clipboard_clear()
+                root.clipboard_append(full_path)
+                root.update()
+                return True, "path"
+
+    return False, "none"
+
+
+def open_audio(filepath):
+    """Cross-platform audio playback."""
+    full_path = os.path.abspath(filepath)
+    if IS_WINDOWS:
+        os.startfile(full_path)
+    elif IS_MAC:
+        subprocess.Popen(["open", full_path])
+    else:
+        subprocess.Popen(["xdg-open", full_path])
+
+
+# ── Folder picker dialog (shown when no CLI args given) ───────────────────────
+
+class FolderPickerDialog:
+    def __init__(self, root):
+        self.root = root
+        self.audio_folder = None
+        self.text_folder = None
+        self._build()
+
+    def _build(self):
+        BG     = "#1a1a1a"
+        FG     = "#e8e8e8"
+        ACCENT = "#f0c040"
+        MUTED  = "#888"
+        BORDER = "#333"
+
+        self.win = tk.Toplevel(self.root)
+        self.win.title("Transcriber — Setup")
+        self.win.configure(bg=BG)
+        self.win.resizable(False, False)
+        self.win.grab_set()
+
+        tk.Label(self.win, text="▶ TRANSCRIBER SETUP", bg=BG, fg=ACCENT,
+                 font=("Courier", 13, "bold"), pady=16).pack()
+
+        tk.Label(self.win, text="Select your audio and output folders to get started.",
+                 bg=BG, fg=MUTED, font=("Courier", 9)).pack(pady=(0, 16))
+
+        frame = tk.Frame(self.win, bg=BG, padx=24)
+        frame.pack(fill="x")
+
+        btn_style = dict(font=("Courier", 9), relief="flat", bd=0,
+                         padx=10, pady=5, cursor="hand2",
+                         bg=BORDER, fg=FG,
+                         activebackground="#444", activeforeground=FG)
+
+        # Audio folder
+        tk.Label(frame, text="AUDIO FOLDER", bg=BG, fg=MUTED,
+                 font=("Courier", 8)).grid(row=0, column=0, sticky="w", pady=(0, 2))
+        self.audio_var = tk.StringVar(value="(not selected)")
+        tk.Label(frame, textvariable=self.audio_var, bg=BG, fg=ACCENT,
+                 font=("Courier", 9), wraplength=400, justify="left").grid(
+                     row=1, column=0, sticky="w")
+        tk.Button(frame, text="Browse…", command=self._pick_audio, **btn_style).grid(
+            row=1, column=1, padx=(12, 0))
+
+        tk.Frame(frame, bg=BORDER, height=1).grid(row=2, column=0, columnspan=2,
+                                                   sticky="ew", pady=14)
+
+        # Output folder
+        tk.Label(frame, text="OUTPUT / TRANSCRIPTS FOLDER", bg=BG, fg=MUTED,
+                 font=("Courier", 8)).grid(row=3, column=0, sticky="w", pady=(0, 2))
+        self.output_var = tk.StringVar(value="(not selected)")
+        tk.Label(frame, textvariable=self.output_var, bg=BG, fg=ACCENT,
+                 font=("Courier", 9), wraplength=400, justify="left").grid(
+                     row=4, column=0, sticky="w")
+        tk.Button(frame, text="Browse…", command=self._pick_output, **btn_style).grid(
+            row=4, column=1, padx=(12, 0))
+
+        frame.columnconfigure(0, weight=1)
+
+        tk.Button(self.win, text="Start →",
+                  font=("Courier", 11, "bold"),
+                  bg=ACCENT, fg="#1a1a1a",
+                  activebackground="#d4a820", activeforeground="#1a1a1a",
+                  relief="flat", bd=0, padx=20, pady=8, cursor="hand2",
+                  command=self._confirm).pack(pady=20)
+
+        self.win.geometry("520x320")
+        self.win.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _pick_audio(self):
+        path = filedialog.askdirectory(title="Select audio folder")
+        if path:
+            self.audio_var.set(path)
+
+    def _pick_output(self):
+        path = filedialog.askdirectory(title="Select output/transcripts folder")
+        if path:
+            self.output_var.set(path)
+
+    def _confirm(self):
+        a = self.audio_var.get()
+        o = self.output_var.get()
+        if a == "(not selected)" or o == "(not selected)":
+            messagebox.showwarning("Missing folders",
+                                   "Please select both folders before continuing.",
+                                   parent=self.win)
+            return
+        self.audio_folder = a
+        self.text_folder  = o
+        self.win.destroy()
+
+    def _cancel(self):
+        self.root.destroy()
+        sys.exit(0)
+
+
+# ── Main App ──────────────────────────────────────────────────────────────────
+
+class TranscriberApp:
+    def __init__(self, root, audio_folder, text_folder):
+        self.root = root
+        self.audio_folder = audio_folder
+        self.text_folder  = text_folder
+
+        self.root.title("Transcriber")
+        self.root.resizable(True, True)
+
+        self.current_file = None
+        self._has_pending_warnings = False
+        self._bad_transcript = ""
+        self._skipped = load_skipped(text_folder)  # basenames persisted to skipped.log
+
+        self._build_ui()
+        self._load_next()
+
+    def _build_ui(self):
+        BG      = "#1a1a1a"
+        SURFACE = "#252525"
+        FG      = "#e8e8e8"
+        MUTED   = "#888"
+        ACCENT  = "#f0c040"
+        GREEN   = "#40e08a"
+        BORDER  = "#333"
+
+        self.root.configure(bg=BG)
+
+        # ── Top bar ──
+        top = tk.Frame(self.root, bg=BG, pady=10, padx=16)
+        top.pack(fill="x")
+
+        self.progress_var = tk.StringVar(value="...")
+        tk.Label(top, textvariable=self.progress_var, bg=BG, fg=MUTED,
+                 font=("Courier", 10)).pack(side="right")
+
+        tk.Label(top, text="▶ TRANSCRIBER", bg=BG, fg=ACCENT,
+                 font=("Courier", 13, "bold")).pack(side="left")
+
+        # ── File info ──
+        info = tk.Frame(self.root, bg=SURFACE, padx=16, pady=14)
+        info.pack(fill="x", padx=12, pady=(0, 8))
+
+        tk.Label(info, text="NOW TRANSCRIBING", bg=SURFACE, fg=MUTED,
+                 font=("Courier", 8)).pack(anchor="w")
+
+        self.filename_var = tk.StringVar(value="loading...")
+        tk.Label(info, textvariable=self.filename_var, bg=SURFACE, fg=ACCENT,
+                 font=("Courier", 15, "bold"), wraplength=600, justify="left").pack(anchor="w", pady=(2, 10))
+
+        # ── Buttons row ──
+        btn_row = tk.Frame(info, bg=SURFACE)
+        btn_row.pack(anchor="w")
+
+        btn_style = dict(
+            font=("Courier", 9), relief="flat", bd=0,
+            padx=12, pady=6, cursor="hand2"
+        )
+
+        self.copy_audio_btn = tk.Button(btn_row, text="⎘  Copy audio file",
+                                        bg=BORDER, fg=FG,
+                                        activebackground="#444", activeforeground=FG,
+                                        command=self._copy_audio, **btn_style)
+        self.copy_audio_btn.pack(side="left", padx=(0, 8))
+
+        self.prompt_btn = tk.Button(btn_row, text="✦  Gemini prompt 1",
+                                    bg=BORDER, fg=FG,
+                                    activebackground="#444", activeforeground=FG,
+                                    command=self._copy_prompt_1, **btn_style)
+        self.prompt_btn.pack(side="left", padx=(0, 8))
+
+        self.prompt_btn2 = tk.Button(btn_row, text="✦  Gemini prompt 2",
+                                     bg=BORDER, fg=FG,
+                                     activebackground="#444", activeforeground=FG,
+                                     command=self._copy_prompt_2, **btn_style)
+        self.prompt_btn2.pack(side="left", padx=(0, 8))
+
+        self.play_btn = tk.Button(btn_row, text="▶  Play audio",
+                                  bg=BORDER, fg=FG,
+                                  activebackground="#444", activeforeground=FG,
+                                  command=self._play_audio, **btn_style)
+        self.play_btn.pack(side="left")
+
+        # ── Warning banner (hidden until needed) ──
+        self.warn_frame = tk.Frame(self.root, bg="#3a2000", padx=14, pady=10)
+        self.warn_var = tk.StringVar(value="")
+        tk.Label(self.warn_frame, textvariable=self.warn_var,
+                 bg="#3a2000", fg="#f0a040",
+                 font=("Courier", 9), wraplength=660, justify="left").pack(anchor="w")
+
+        # ── Textarea ──
+        self.textarea_frame = tk.Frame(self.root, bg=BG, padx=12)
+        self.textarea_frame.pack(fill="both", expand=True, pady=(4, 0))
+
+        tk.Label(self.textarea_frame, text="Paste transcript below — auto-saves on paste",
+                 bg=BG, fg=MUTED, font=("Courier", 8)).pack(anchor="w", pady=(0, 4))
+
+        self.text = tk.Text(
+            self.textarea_frame,
+            font=("sans-serif", 12),
+            bg=SURFACE, fg=FG,
+            insertbackground=FG,
+            relief="flat", bd=0,
+            padx=12, pady=12,
+            wrap="word",
+            height=14,
+            undo=True,
+        )
+        self.text.pack(fill="both", expand=True)
+        self.text.bind("<<Paste>>", self._on_paste)
+
+        # ── Bottom bar ──
+        bottom = tk.Frame(self.root, bg=BG, padx=12, pady=10)
+        bottom.pack(fill="x")
+
+        self.status_var = tk.StringVar(value="")
+        self.status_label = tk.Label(bottom, textvariable=self.status_var,
+                                     bg=BG, fg=GREEN, font=("Courier", 9))
+        self.status_label.pack(side="left")
+
+        # Skip button (always visible, enabled only when there's a file loaded)
+        self.skip_btn = tk.Button(bottom, text="Skip  ⇥",
+                                  font=("Courier", 10),
+                                  bg=BORDER, fg=FG,
+                                  activebackground="#444", activeforeground=FG,
+                                  relief="flat", bd=0, padx=12, pady=7,
+                                  cursor="hand2",
+                                  command=self._skip)
+        self.skip_btn.pack(side="right", padx=(8, 0))
+
+        self.save_btn = tk.Button(bottom, text="Save & next  →",
+                                  font=("Courier", 10, "bold"),
+                                  bg=ACCENT, fg="#1a1a1a",
+                                  activebackground="#d4a820", activeforeground="#1a1a1a",
+                                  relief="flat", bd=0, padx=16, pady=7,
+                                  cursor="hand2",
+                                  command=self._save)
+        self.save_btn.pack(side="right")
+
+        # ── Queue ──
+        queue_frame = tk.Frame(self.root, bg=BG, padx=12)
+        queue_frame.pack(fill="x")
+
+        tk.Label(queue_frame, text="UP NEXT:", bg=BG, fg=MUTED,
+                 font=("Courier", 8)).pack(side="left", padx=(0, 8))
+
+        self.queue_var = tk.StringVar(value="")
+        tk.Label(queue_frame, textvariable=self.queue_var, bg=BG, fg="#555",
+                 font=("Courier", 8)).pack(side="left")
+
+        self.root.geometry("700x580")
+
+    # ── Warning banner helpers ──
+
+    def _show_warning_banner(self, warnings, bad_transcript):
+        lines = "\n".join(f"⚠  {w}" for w in warnings)
+        self.warn_var.set(
+            lines + "\n\nRe-paste a corrected version to try again, "
+            "or click  'Skip  ⇥'  to move to the next file."
+        )
+        self.warn_frame.pack(fill="x", padx=12, pady=(0, 4),
+                             before=self.textarea_frame)
+        self._has_pending_warnings = True
+        self._bad_transcript = bad_transcript
+        # Clear textarea so user can paste fresh
+        self.text.delete("1.0", "end")
+        # Disable save button — must fix or skip
+        self.save_btn.config(state="disabled", text="Save & next  →",
+                             bg="#555", fg="#999",
+                             activebackground="#555", activeforeground="#999")
+
+    def _hide_warning_banner(self):
+        self.warn_frame.pack_forget()
+        self._has_pending_warnings = False
+        self.save_btn.config(
+            state="normal",
+            text="Save & next  →",
+            bg="#f0c040", fg="#1a1a1a",
+            activebackground="#d4a820", activeforeground="#1a1a1a"
+        )
+
+    # ── Load ──
+
+    def _load_next(self):
+        all_pending = get_pending(self.audio_folder, self.text_folder)
+        # Filter out permanently skipped files (matched by basename)
+        pending = [f for f in all_pending
+                   if os.path.basename(f) not in self._skipped]
+
+        total = len(get_audio_files(self.audio_folder))
+        done  = get_done_count(self.audio_folder, self.text_folder)
+
+        skipped_count = len(self._skipped)
+        progress = f"{done} / {total} done"
+        if skipped_count:
+            progress += f"  ({skipped_count} skipped)"
+        self.progress_var.set(progress)
+        self._hide_warning_banner()
+
+        if not pending:
+            if self._skipped:
+                self.filename_var.set(f"✓ Done! ({skipped_count} file(s) skipped)")
+            else:
+                self.filename_var.set("✓ All done!")
+            self.text.config(state="disabled")
+            self.save_btn.config(state="disabled")
+            self.skip_btn.config(state="disabled")
+            self.queue_var.set("")
+            self.current_file = None
+            return
+
+        self.current_file = pending[0]
+        self.filename_var.set(os.path.basename(self.current_file))
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.status_var.set("")
+        self.save_btn.config(state="normal")
+        self.skip_btn.config(state="normal")
+
+        upcoming = [os.path.basename(f) for f in pending[1:7]]
+        self.queue_var.set("  →  ".join(upcoming) if upcoming else "—")
+
+    # ── Paste / Save logic ──
+
+    def _on_paste(self, event):
+        self.root.after(80, self._auto_save)
+
+    def _auto_save(self):
+        """Called on paste — auto-cleans repetitions, validates length, saves if clean."""
+        if not self.current_file:
+            return
+
+        raw = self.text.get("1.0", "end").strip()
+        if not raw:
+            return
+
+        cleaned, warnings = validate_transcript(raw)
+
+        # Update textarea with cleaned text
+        if cleaned != raw:
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", cleaned)
+
+        if self._check_duplicate(cleaned):
+            return
+
+        if warnings:
+            self._show_warning_banner(warnings, cleaned)
+            note = "Repetitions removed. " if cleaned != raw else ""
+            self._flash_status(f"{note}Length issue — try the other prompt or Thinking Mode.", error=True)
+            return
+
+        if cleaned != raw:
+            self._flash_status("Repetitions auto-removed  ✓")
+
+        self._do_save(cleaned)
+
+    def _save(self):
+        """Called by Save button — only reachable when no warnings are active."""
+        if not self.current_file:
+            return
+
+        transcript = self.text.get("1.0", "end").strip()
+        if not transcript:
+            self._flash_status("Nothing to save.", error=True)
+            return
+
+        if self._check_duplicate(transcript):
+            return
+
+        self._do_save(transcript)
+
+    def _skip(self):
+        """Skip the current file permanently — logged to skipped.log in the output folder."""
+        if not self.current_file:
+            return
+        basename = os.path.basename(self.current_file)
+        self._skipped.add(basename)
+        save_skipped(self.text_folder, basename)
+        self._flash_status(f"Skipped  ⇥  {basename}")
+        self._load_next()
+
+    def _check_duplicate(self, transcript):
+        """Returns True and shows warning if transcript is a duplicate."""
+        if transcript in all_transcripts(self.audio_folder, self.text_folder):
+            messagebox.showwarning(
+                "Duplicate",
+                "This transcript already exists for another file.\nNot saved."
+            )
+            return True
+        return False
+
+    def _do_save(self, transcript):
+        os.makedirs(self.text_folder, exist_ok=True)
+        tp = transcript_path(self.current_file, self.text_folder)
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(transcript)
+        self._flash_status(f"Saved  ✓  {os.path.basename(tp)}")
+        self._load_next()
+
+    # ── Button actions ──
+
+    def _copy_audio(self):
+        if not self.current_file:
+            return
+        ok, mode = copy_to_clipboard(self.root, filepath=self.current_file)
+        if ok:
+            label = "Audio file copied  ✓" if mode == "file" else "Path copied as text  ✓"
+            btn_text = "✓  Copied!" if mode == "file" else "✓  Path Copied!"
+            self._flash_status(label)
+            self.copy_audio_btn.config(text=btn_text)
+        else:
+            self._flash_status("Could not copy to clipboard.", error=True)
+        self.root.after(2000, lambda: self.copy_audio_btn.config(text="⎘  Copy audio file"))
+
+    def _copy_prompt_1(self):
+        copy_to_clipboard(self.root, text=GEMINI_PROMPT_1)
+        self._flash_status("Gemini prompt 1 copied  ✓")
+        self.prompt_btn.config(text="✓  Copied!")
+        self.root.after(2000, lambda: self.prompt_btn.config(text="✦  Gemini prompt 1"))
+
+    def _copy_prompt_2(self):
+        copy_to_clipboard(self.root, text=GEMINI_PROMPT_2)
+        self._flash_status("Gemini prompt 2 copied  ✓")
+        self.prompt_btn2.config(text="✓  Copied!")
+        self.root.after(2000, lambda: self.prompt_btn2.config(text="✦  Gemini prompt 2"))
+
+    def _play_audio(self):
+        if not self.current_file:
+            return
+        try:
+            open_audio(self.current_file)
+            self._flash_status("Playing audio  ✓")
+            self.play_btn.config(text="▶  Playing…")
+            self.root.after(2000, lambda: self.play_btn.config(text="▶  Play audio"))
+        except Exception as e:
+            self._flash_status(f"Could not play: {e}", error=True)
+
+    def _flash_status(self, msg, error=False):
+        self.status_var.set(msg)
+        self.status_label.config(fg="#f05060" if error else "#40e08a")
+        self.root.after(4000, lambda: self.status_var.set(""))
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    root = tk.Tk()
+    root.withdraw()  # hide root until ready
+
+    audio_folder = args.audio
+    text_folder  = args.output
+
+    # If either folder not provided via CLI, show the folder picker dialog
+    if not audio_folder or not text_folder:
+        picker = FolderPickerDialog(root)
+        root.wait_window(picker.win)
+        audio_folder = picker.audio_folder
+        text_folder  = picker.text_folder
+
+    if not audio_folder or not text_folder:
+        sys.exit(0)
+
+    os.makedirs(text_folder, exist_ok=True)
+
+    root.deiconify()
+    app = TranscriberApp(root, audio_folder, text_folder)
+    root.mainloop()

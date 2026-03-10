@@ -6,12 +6,8 @@ A lightweight desktop app to assist manual transcribing audio files using Gemini
 
 ```bash
 sudo apt install python3-tk xclip wl-clipboard
-```
-
-```bash
 git clone https://github.com/your-org/transcriber.git
 cd transcriber
-pip install -r requirements.txt
 python transcribe.py
 ```
 
@@ -19,8 +15,7 @@ python transcribe.py
 
 ```bash
 git clone https://github.com/your-org/transcriber.git
-cd transcripts
-pip install -r requirements.txt
+cd transcriber
 python transcribe.py
 ```
 

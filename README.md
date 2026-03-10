@@ -6,7 +6,7 @@ A desktop app to help you transcribe Ghanaian audio files using Gemini.
 
 ```bash
 sudo apt install python3-tk xclip wl-clipboard
-git clone https://github.com/your-org/ghana-transcriber.git
+git clone https://github.com/GhanaNLP/transcriber.git
 cd ghana-transcriber
 python transcribe.py --code YOUR_CODE
 ```
@@ -14,7 +14,7 @@ python transcribe.py --code YOUR_CODE
 ## Setup — Windows
 
 ```bash
-git clone https://github.com/your-org/ghana-transcriber.git
+git clone https://github.com/GhanaNLP/transcriber.git
 cd ghana-transcriber
 python transcribe.py --code YOUR_CODE
 ```

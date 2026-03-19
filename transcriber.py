@@ -29,7 +29,7 @@ IS_LINUX   = platform.system() == "Linux"
 IS_MAC     = platform.system() == "Darwin"
 
 # ── Average character threshold ───────────────────────────────────────────────
-AVG_CHARS_THRESHOLD = 27000
+AVG_CHARS_THRESHOLD = 13500
 
 # ── HF output repo (transcripts are pushed here) ─────────────────────────────
 HF_OUTPUT_REPO = "ghananlpcommunity/ghana-asr-transcripts"
@@ -44,8 +44,8 @@ TINY_LANG_DETECTOR_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)
 
 # ── Language detection threshold ─────────────────────────────────────────────
 # Warn the volunteer if fewer than this fraction of sentences match the language
-LANG_DETECTION_WARN_THRESHOLD = 0.40   # below this → show a warning
-LANG_DETECTION_BLOCK_THRESHOLD = 0.15  # below this → block saving
+LANG_DETECTION_WARN_THRESHOLD = 0.70   # below this → show a warning
+LANG_DETECTION_BLOCK_THRESHOLD = 0.70  # below this → block saving
 
 # ── Gemini Prompts ────────────────────────────────────────────────────────────
 GEMINI_PROMPT_1 = (
@@ -464,27 +464,53 @@ def open_audio(filepath):
         subprocess.Popen(["xdg-open", full_path])
 
 
-# ── Saved Code Helpers ────────────────────────────────────────────────────────
+# ── Session config (code + folder paths persisted across launches) ────────────
 
-CODE_FILE = ".volunteer_code"
+import json as _json
 
-def load_saved_code(base_dir):
-    path = os.path.join(base_dir, CODE_FILE)
-    if os.path.exists(path):
+CONFIG_FILE = ".transcriber_config"
+
+def load_session(base_dir):
+    """Return saved (code, audio_folder, text_folder) or (None, None, None)."""
+    path = os.path.join(base_dir, CONFIG_FILE)
+    try:
         with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return None
+            data = _json.load(f)
+        return (
+            data.get("code")         or None,
+            data.get("audio_folder") or None,
+            data.get("text_folder")  or None,
+        )
+    except Exception:
+        return None, None, None
 
-def save_saved_code(code, base_dir):
-    path = os.path.join(base_dir, CODE_FILE)
+def save_session(base_dir, code=None, audio_folder=None, text_folder=None):
+    path = os.path.join(base_dir, CONFIG_FILE)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+    except Exception:
+        data = {}
+    if code         is not None: data["code"]         = code.strip()
+    if audio_folder is not None: data["audio_folder"] = audio_folder
+    if text_folder  is not None: data["text_folder"]  = text_folder
     with open(path, "w", encoding="utf-8") as f:
-        f.write(code.strip())
+        _json.dump(data, f)
+
+def clear_session(base_dir):
+    path = os.path.join(base_dir, CONFIG_FILE)
+    if os.path.exists(path):
+        os.remove(path)
+    # Also remove old single-value code file if present
+    old = os.path.join(base_dir, ".volunteer_code")
+    if os.path.exists(old):
+        os.remove(old)
 
 
 # ── Startup Dialog ────────────────────────────────────────────────────────────
 
 class StartupDialog:
-    def __init__(self, root, prefill_code=None):
+    def __init__(self, root, prefill_code=None, prefill_audio=None, prefill_output=None):
         BG     = "#f5f6fa"
         FG     = "#2c3e50"
         MUTED  = "#7f8c8d"
@@ -517,6 +543,11 @@ class StartupDialog:
         if prefill_code:
             self.code_entry.insert(0, prefill_code)
 
+        # If we have a saved code, show a small note so the volunteer knows
+        if prefill_code:
+            tk.Label(frame, text="✓ Code loaded from last session",
+                     bg=BG, fg="#27ae60", font=("Arial", 8)).pack(anchor="w", pady=(0, 2))
+
         self.code_hint = tk.Label(
             frame,
             text="ℹ  Your code verifies your assigned files and lets you push to HuggingFace.",
@@ -530,7 +561,7 @@ class StartupDialog:
         audio_row = tk.Frame(frame, bg=BG)
         audio_row.pack(fill="x", pady=(4, 12))
 
-        self.audio_var = tk.StringVar()
+        self.audio_var = tk.StringVar(value=prefill_audio or "")
         tk.Entry(audio_row, textvariable=self.audio_var, font=("Arial", 10),
                  relief="solid", bd=1, state="readonly").pack(
                      side="left", fill="x", expand=True, ipady=5)
@@ -546,7 +577,7 @@ class StartupDialog:
         output_row = tk.Frame(frame, bg=BG)
         output_row.pack(fill="x", pady=(4, 16))
 
-        self.output_var = tk.StringVar()
+        self.output_var = tk.StringVar(value=prefill_output or "")
         tk.Entry(output_row, textvariable=self.output_var, font=("Arial", 10),
                  relief="solid", bd=1, state="readonly").pack(
                      side="left", fill="x", expand=True, ipady=5)
@@ -831,13 +862,11 @@ class TranscriberApp:
         if messagebox.askyesno(
             "Logout",
             "Are you sure you want to log out?\n\n"
-            "This will clear your saved code and close the app.",
+            "This will clear your saved settings and close the app.",
             parent=self.root
         ):
-            base_dir  = os.path.dirname(os.path.abspath(__file__))
-            code_path = os.path.join(base_dir, CODE_FILE)
-            if os.path.exists(code_path):
-                os.remove(code_path)
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            clear_session(base_dir)
             self.root.destroy()
             sys.exit(0)
 
@@ -1135,27 +1164,34 @@ if __name__ == "__main__":
     text_folder    = args.output
     volunteer_code = args.code
 
-    if not volunteer_code:
-        saved = load_saved_code(base_dir)
-        if saved and decode_code(saved) is not None:
-            volunteer_code = saved
+    # Load saved session (code + both folder paths)
+    saved_code, saved_audio, saved_output = load_session(base_dir)
 
-    all_provided = audio_folder and text_folder
-    if all_provided and volunteer_code:
+    if not volunteer_code and saved_code and decode_code(saved_code) is not None:
+        volunteer_code = saved_code
+    if not audio_folder  and saved_audio and os.path.isdir(saved_audio):
+        audio_folder = saved_audio
+    if not text_folder   and saved_output:
+        text_folder = saved_output
+
+    # If all three are known and audio folder still exists, skip the setup dialog
+    all_provided = (audio_folder and os.path.isdir(audio_folder) and text_folder and volunteer_code)
+
+    if all_provided:
         ok, _, _, missing, extra = verify_audio_against_code(audio_folder, volunteer_code)
-        if not ok:
-            msgs = []
-            if missing:
-                msgs.append(f"Missing {len(missing)} assigned file(s).")
-            if extra:
-                msgs.append(f"{len(extra)} unassigned file(s) found (they will be ignored).")
-            messagebox.showwarning(
-                "Assignment mismatch",
-                "\n".join(msgs) +
-                "\n\nProceed anyway? Only your assigned files will count."
-            )
+        if not ok and missing:
+            # Saved audio path may have moved — fall through to dialog
+            all_provided = False
+
+    if all_provided:
+        pass  # go straight to the app
     else:
-        dialog = StartupDialog(root, prefill_code=volunteer_code)
+        dialog = StartupDialog(
+            root,
+            prefill_code   = volunteer_code,
+            prefill_audio  = audio_folder,
+            prefill_output = text_folder,
+        )
         root.wait_window(dialog.win)
 
         if dialog.result_audio_folder and dialog.result_text_folder:
@@ -1168,8 +1204,11 @@ if __name__ == "__main__":
     if not audio_folder or not text_folder:
         sys.exit(0)
 
-    if volunteer_code:
-        save_saved_code(volunteer_code, base_dir)
+    # Persist everything for next launch
+    save_session(base_dir,
+                 code=volunteer_code,
+                 audio_folder=audio_folder,
+                 text_folder=text_folder)
 
     os.makedirs(text_folder, exist_ok=True)
 

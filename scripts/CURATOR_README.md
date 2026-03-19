@@ -1,159 +1,149 @@
 # Data Curator Reference — Ghana Audio Transcription
 
-Everything you need to run this project from start to finish.
-
 ---
 
-## Repo Structure
+## Repo structure
 
 ```
-ghana-transcriber/
-├── transcribe.py                        ← volunteers run this
-├── README.md                            ← volunteer-facing instructions
-├── .gitignore
-├── .github/
-│   └── ISSUE_TEMPLATE/
-│       └── result_submission.md         ← pre-fills the GitHub submission form
+transcriber/
+├── transcriber.py          ← volunteers run this
+├── README.md               ← volunteer instructions
+├── CURATOR_README.md       ← you are here
 └── scripts/
-    ├── DATA_CURATOR_README.md           ← you are here
-    ├── upload_to_hf.py                  ← run once to upload audio to HuggingFace
-    ├── generate_codes.py                ← generate one code per volunteer
-    └── merge_results.py                 ← fetch submissions and merge transcripts
+    └── generate_codes.py   ← generate codes + zip archives
 ```
 
-Private files (never commit these):
+Private files (never commit):
 ```
-manifest.csv             ← produced by upload_to_hf.py, keep locally
-volunteer_codes.json     ← all codes + file ID lists
-.github_token            ← saved GitHub token for private repo access
+scripts/volunteer_codes.csv       ← all codes and assignments
+scripts/volunteer_archives/       ← per-volunteer zip archives
+```
+
+HuggingFace output repo:
+```
+ghananlpcommunity/ghana-asr-transcripts
 ```
 
 ---
 
-## One-Time Setup
+## Step 1 — Prepare your audio
 
-### 1. Upload audio to HuggingFace
+Organise audio files into per-language folders (paths can be anywhere):
 
-Open `scripts/upload_to_hf.py` and set:
-
-```python
-HF_REPO          = "your-hf-username/ghana-audio-master"
-HF_TOKEN         = "hf_..."          # or export HF_TOKEN=hf_...
-LANGUAGE_FOLDERS = {
-    "twi":     "/path/to/twi",
-    "ewe":     "/path/to/ewe",
-    "dagbani": "/path/to/dagbani",
-}
 ```
-
-Then run:
-
-```bash
-pip install huggingface_hub pandas
-python scripts/upload_to_hf.py
+/your/path/twi/        ← all Twi .mp3 / .wav files
+/your/path/ewe/
+/your/path/dagbani/
 ```
-
-This uploads all audio files and writes `manifest.csv` locally. Commit `manifest.csv` to the repo.
 
 ---
 
-### 2. Configure generate_codes.py
+## Step 2 — Generate codes and archives
 
-Open `scripts/generate_codes.py` and set:
+Open `scripts/generate_codes.py` and set the config block at the top:
 
 ```python
-HF_REPO      = "your-hf-username/ghana-audio-master"   # same as above
-MANIFEST_CSV = "manifest.csv"
-
-FILES_PER_LANGUAGE = {
-    "twi":     200,    # total files to share across twi volunteers
-    "ewe":     200,
-    "dagbani": 200,
+LANGUAGE_AUDIO_DIRS = {
+    "twi":     "/path/to/twi/audio",
+    "ewe":     "/path/to/ewe/audio",
+    "dagbani": "/path/to/dagbani/audio",
 }
-
+HF_TOKEN = "hf_..."          # write token for the output HF repo
 VOLUNTEERS_PER_LANGUAGE = {
-    "twi":     2,
-    "ewe":     2,
-    "dagbani": 1,
+    "twi": 12, "ewe": 2, "dagbani": 2,
 }
+ARCHIVES_DIR = "scripts/volunteer_archives"
 ```
 
 Then run:
 
 ```bash
-pip install pandas
 python scripts/generate_codes.py
 ```
 
-This prints a table of codes and saves `volunteer_codes.json`. Send **one code per volunteer** — keep `volunteer_codes.json` private.
+**Re-running is safe** — if a volunteer's `.zip` already exists it is skipped. Only new volunteers get new archives. Codes are always regenerated and saved to `volunteer_codes.csv`.
+
+The code for each volunteer encodes their language, assigned file IDs, and HF token — the transcriber app uses all three automatically.
 
 ---
 
-### 3. Configure merge_results.py
+## Step 3 — Distribute
 
-Open `scripts/merge_results.py` and set:
+Each volunteer needs **two things**, sent separately:
 
-```python
-GITHUB_REPO = "your-username/ghana-transcriber"
-```
+1. **Their `.zip` archive** — via Drive, WeTransfer, WhatsApp, etc.
+2. **Their code string** — via message or email
 
----
+They extract the zip, run `python transcriber.py`, paste their code, and point the app at the folder. The app handles everything else.
 
-### 4. Commit and push
-
-```bash
-git add transcribe.py manifest.csv README.md scripts/ .github/ .gitignore
-git commit -m "Initial setup"
-git push
-```
-
-Make sure `.gitignore` contains:
-```
-.env
-volunteer_codes.json
-.github_token
-```
+> Keep `volunteer_codes.csv` private — it contains the HF token for every volunteer.
 
 ---
 
-## Tracking Submissions
+## Step 4 — Share the app
 
-Submissions arrive as GitHub Issues labelled **results**. View them at:
+Send volunteers to the repo and ask them to follow README.md:
 
 ```
-https://github.com/YOUR_USERNAME/ghana-transcriber/issues?q=label%3Aresults
+https://github.com/GhanaNLP/transcriber
 ```
 
-Each issue should have a `.zip` file attached containing the volunteer's transcripts folder.
+What volunteers need:
+- Python 3.8+
+- Git
+- Their zip archive (extracted)
+- Their code string
+
+On Linux they also need: `sudo apt install python3-tk xclip wl-clipboard git`
 
 ---
 
-## Merging Results
+## How language checking works
 
-```bash
-pip install requests
-python scripts/merge_results.py
-```
+Each volunteer's code contains their assigned language. When a transcript is pasted, the app uses [tiny-lang-detector](https://github.com/GhanaNLP/tiny-lang-detector) to check that it matches. This catches accidental wrong pastes without bothering volunteers whose audio genuinely contains heavy English mixing.
 
-The script:
-1. Fetches all issues labelled `results` from your GitHub repo
-2. Downloads every `.zip` attachment
-3. Extracts `.txt` transcripts and organises them into `merged_transcripts/<lang>/`
-4. Skips files already downloaded — safe to re-run as more submissions arrive
-5. Prints a per-language summary
+The detector is cloned and installed automatically when the app first runs — volunteers don't do anything.
 
-For a **private repo**, the script will prompt for a GitHub token once, then save it to `.github_token`.  
-Create one at: https://github.com/settings/tokens/new (tick **repo** scope).
+Thresholds (in `transcriber.py`):
+- `LANG_DETECTION_WARN_THRESHOLD = 0.40` — below this, show a warning (saveable)
+- `LANG_DETECTION_BLOCK_THRESHOLD = 0.15` — below this, block saving
 
 ---
 
-## If a Volunteer Has Problems
+## Monitoring progress
 
-**Download fails / slow connection:**  
-Their partially downloaded files are kept — re-running `python transcribe.py --code <code>` resumes from where it left off (already-downloaded files are skipped).
+Transcripts are pushed to:
+```
+https://huggingface.co/datasets/ghananlpcommunity/ghana-asr-transcripts
+```
 
-**They need to restart from scratch:**  
-They delete their local `audio/` folder and re-run with the same code.
+Each commit is labelled:
+```
+Volunteer a3f8c912: 10 transcript(s) [lang=twi]
+```
 
-**You need more volunteers mid-run:**  
-Increase `VOLUNTEERS_PER_LANGUAGE` or `FILES_PER_LANGUAGE` in `generate_codes.py` and regenerate. New codes will cover only the files not yet assigned.
+Files are stored as:
+```
+transcripts/twi/<filename>__<vol_hash>.txt
+```
+
+The `__vol_hash` suffix means multiple volunteers never overwrite each other.
+
+---
+
+## Troubleshooting
+
+**"Assignment mismatch"**
+Volunteer selected the wrong folder. Ask them to re-extract their specific zip.
+
+**Push keeps failing**
+Check that the HF token in `generate_codes.py` still has write access. Re-generate codes and redistribute if needed.
+
+**Adding more volunteers mid-run**
+Increase `VOLUNTEERS_PER_LANGUAGE` and re-run `generate_codes.py`. Existing archives are untouched.
+
+**Volunteer needs to restart**
+They delete their transcripts output folder and reopen the app with the same audio folder and code.
+
+**Volunteer lost their code**
+Re-send it from `volunteer_codes.csv`. It will be saved again once they enter it.

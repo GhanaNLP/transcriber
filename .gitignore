@@ -3,6 +3,7 @@ manifest.csv
 volunteer_codes.csv
 scripts/volunteer_codes.csv
 .volunteer_code
+tiny-lang-detector/
 
 # ── Local audio and transcripts (volunteer working files) ──────────────────────
 audio/
